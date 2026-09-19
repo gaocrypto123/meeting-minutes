@@ -1,76 +1,71 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""初始化会议纪要工作目录（Phase 0 用）。
+"""meeting-minutes v2 · Phase 0 建档（含开工确认单）
 
-创建：<输出根目录>/<会议名>_纪要/{meta.md, checkpoints.md}
+建出三层结构，让「原文」和「纪要」物理分开：
+
+    <根目录>/<会议名>_<日期>/
+    ├── 原文/        转写稿（机器产出，不改动）
+    ├── 纪要/        交付物（Word / HTML / 待确认清单 / 图文摘要）
+    └── 过程/        meta.md（开工确认单）、checkpoints.md（节点记录）
 
 用法：
-    python init_meeting_workspace.py "结算流程改版评审会" \
-        --dir "." --type 决策评审 --date 2026-09-18 \
-        --location "3F 会议室A" --attendees "张三(主持),李四" --output both
+    python init_meeting_workspace.py "会议纪要技能优化讨论" --dir "D:\\会议" \
+        --type 内部工作会 --date 2026-09-19 --speakers 4 \
+        --attendees "A(主持,发言),B(发言),C(发言),D(发言),某同学(未发言)" \
+        --output word,digest --noise keep
 """
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
 
-TEMPLATES = {
-    "跨部门对接": ["会议背景", "议题与讨论要点", "意见总结", "行动项", "待确认与风险"],
-    "内部工作会": ["会议背景", "进展同步", "问题与阻塞", "意见总结", "行动项与下周计划"],
-    "决策评审": ["会议背景与评审对象", "评审意见", "决策结论", "行动项", "待确认与风险"],
-    "外部沟通": ["会议背景", "客户需求与反馈", "我方回应与承诺", "行动项", "待确认与风险"],
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mm_common import load_config, load_templates, resolve_template  # noqa: E402
+
+OUTPUT_LABEL = {
+    "word": "Word 纪要", "digest": "图文摘要", "ppt": "PPT（按需生成）",
+    "both": "Word 纪要 + 图文摘要", "all": "Word 纪要 + 图文摘要 + PPT",
 }
 
-ALIASES = {
-    "跨部门": "跨部门对接", "对接": "跨部门对接", "跨部门对接会": "跨部门对接",
-    "内部": "内部工作会", "工作会": "内部工作会", "例会": "内部工作会", "周会": "内部工作会",
-    "决策": "决策评审", "评审": "决策评审", "决策评审会": "决策评审",
-    "外部": "外部沟通", "客户": "外部沟通", "外部沟通会": "外部沟通",
-}
+META_TEMPLATE = """# 开工确认单 · {name}
 
-OUTPUT_LABEL = {"word": "Word 纪要", "ppt": "PPT 汇报", "both": "Word 纪要 + PPT 汇报"}
-
-META_TEMPLATE = """# 会议元信息
-
-| 字段 | 值 |
+| 项目 | 内容 |
 |---|---|
 | 会议名称 | {name} |
 | 会议类型 | {mtype} |
 | 会议日期 | {date} |
 | 会议地点 | {location} |
 | 参会人 | {attendees} |
-| 输出形态 | {output} |
-| 工作目录 | {workdir} |
+| 说话人数 | {speakers} |
+| 交付形态 | {output} |
+| 无关段落 | {noise} |
 | 建档时间 | {now} |
+| 工作目录 | `{workdir}` |
 
-## 本章节骨架（本类型的模板章节，标题不得删）
+## 章节骨架（本类型模板，标题不得删；不涉及写「本次不适用」）
 
 {chapters}
 
-## 事实清单（Phase 5 事实复核用，请补齐）
+## 事实清单（Phase 5 复核用，逐步补齐）
 
 - 参会人与角色：
 - 会议地点：
 - 会议背景（≤3 句）：
 - 议题范围：
+- 无效区间（静音/闲聊/幻觉）：
 """
 
-CHECKPOINTS_HEADER = """# 节点记录 · {name}
-
-> 规则：只追加，不涂改。每个 Phase 结束必须追加一条。
-> 追加命令：`python append_checkpoint.py "<工作目录>" --id CP1 --phase "..." --output "..." --basis "..."`
-
-"""
+NOISE_LABEL = {"keep": "保留并标记【非议题】", "drop": "从正文剔除"}
 
 
 def sanitize(name: str) -> str:
-    """把会议名处理成合法目录名。"""
     clean = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", name).strip(" .")
-    clean = re.sub(r"_{2,}", "_", clean)
-    return clean or "会议"
+    return re.sub(r"_{2,}", "_", clean) or "会议"
 
 
 def main() -> int:
@@ -80,66 +75,70 @@ def main() -> int:
         except Exception:
             pass
 
-    ap = argparse.ArgumentParser(description="初始化会议纪要工作目录")
-    ap.add_argument("meeting_name", help="会议名称，如 结算流程改版评审会")
-    ap.add_argument("--dir", default=".", help="输出根目录，默认当前目录")
-    ap.add_argument("--type", dest="mtype", default="", help="会议类型：跨部门对接/内部工作会/决策评审/外部沟通")
-    ap.add_argument("--date", default="", help="会议日期，如 2026-09-18")
-    ap.add_argument("--location", default="待确认", help="会议地点")
-    ap.add_argument("--attendees", default="待确认", help="参会人，逗号分隔，主持人加 (主持)")
-    ap.add_argument("--output", default="both", choices=["word", "ppt", "both"], help="输出形态")
-    ap.add_argument("--force", action="store_true", help="已存在时覆盖 meta.md / checkpoints.md")
+    ap = argparse.ArgumentParser(description="meeting-minutes v2 建档")
+    ap.add_argument("meeting_name")
+    ap.add_argument("--dir", default=".", help="输出根目录")
+    ap.add_argument("--type", dest="mtype", default="",
+                    help="会议类型：内部工作会/决策评审会/跨部门对接会/外部沟通会/采访访谈")
+    ap.add_argument("--date", default="", help="会议日期，如 2026-09-19")
+    ap.add_argument("--location", default="待确认")
+    ap.add_argument("--attendees", default="待确认",
+                    help="逗号分隔；未发言的人标注 (未发言)")
+    ap.add_argument("--speakers", default="", help="说话人数，如 4；留空则自动判断")
+    ap.add_argument("--output", default="word,digest", help="word,digest,ppt，逗号分隔")
+    ap.add_argument("--noise", default="keep", choices=["keep", "drop"],
+                    help="寒暄/闲聊：keep 保留标记，drop 剔除")
+    ap.add_argument("--suffix", default="", help="目录后缀，默认用日期")
+    ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
-    mtype = ALIASES.get(args.mtype.strip(), args.mtype.strip())
-    if mtype and mtype not in TEMPLATES:
-        print(f"[警告] 未识别的会议类型 '{args.mtype}'，meta.md 中留空，请手动确认。", file=sys.stderr)
-        mtype = ""
+    templates = load_templates()
+    cfg = load_config()
+    mtype = resolve_template(args.mtype)
+    if args.mtype.strip() and not mtype:
+        print(f"[警告] 模板里没有会议类型「{args.mtype}」。可选："
+              f"{'、'.join(templates)}", file=sys.stderr)
     if not mtype:
-        print("[提示] 未指定 --type。章节骨架留空，Phase 3 前必须补上会议类型。", file=sys.stderr)
+        print("[提示] 未指定会议类型，Phase 3 前必须补上。", file=sys.stderr)
 
-    root = Path(args.dir).expanduser().resolve()
-    folder = sanitize(args.meeting_name)
-    if not folder.endswith("纪要"):
-        folder = f"{folder}_纪要"
-    workdir = root / folder
-    workdir.mkdir(parents=True, exist_ok=True)
+    suffix = args.suffix or args.date or datetime.now().strftime("%Y-%m-%d")
+    folder = sanitize(f"{args.meeting_name}_{suffix}")
+    workdir = Path(args.dir).expanduser().resolve() / folder
+    for sub in ("原文", "纪要", "过程"):
+        (workdir / sub).mkdir(parents=True, exist_ok=True)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    chapters = "\n".join(
-        f"{i}. {t}" for i, t in enumerate(TEMPLATES.get(mtype, []), start=1)
-    ) or "（未确定会议类型，待补）"
+    chapters = "\n".join(f"{i}. {t}" for i, t in
+                         enumerate(templates.get(mtype, []), start=1)) or "（未定，待补）"
+    outs = [OUTPUT_LABEL.get(x.strip(), x.strip())
+            for x in args.output.split(",") if x.strip()]
+    speakers = args.speakers.strip() or str(cfg["diarization"].get("speakers", 0) or "自动判断")
 
-    meta_path = workdir / "meta.md"
-    cp_path = workdir / "checkpoints.md"
-
+    meta_path = workdir / "过程" / "meta.md"
     if meta_path.exists() and not args.force:
         print(f"[跳过] meta.md 已存在：{meta_path}")
     else:
-        meta_path.write_text(
-            META_TEMPLATE.format(
-                name=args.meeting_name,
-                mtype=mtype or "待确认",
-                date=args.date or "待确认",
-                location=args.location,
-                attendees=args.attendees,
-                output=OUTPUT_LABEL[args.output],
-                workdir=str(workdir),
-                now=now,
-                chapters=chapters,
-            ),
-            encoding="utf-8",
-        )
+        meta_path.write_text(META_TEMPLATE.format(
+            name=args.meeting_name, mtype=mtype or "待确认", date=args.date or "待确认",
+            location=args.location, attendees=args.attendees, speakers=speakers,
+            output=" + ".join(outs) or "待确认", noise=NOISE_LABEL[args.noise],
+            now=now, workdir=str(workdir), chapters=chapters), encoding="utf-8")
         print(f"[创建] {meta_path}")
 
-    if cp_path.exists() and not args.force:
-        print(f"[跳过] checkpoints.md 已存在：{cp_path}")
-    else:
-        cp_path.write_text(CHECKPOINTS_HEADER.format(name=args.meeting_name), encoding="utf-8")
+    cp_path = workdir / "过程" / "checkpoints.md"
+    if not cp_path.exists() or args.force:
+        cp_path.write_text(
+            f"# 节点记录 · {args.meeting_name}\n\n"
+            "> 规则：只追加，不涂改。每个 Phase 结束追加一条。\n"
+            '> 追加命令：`python scripts/append_checkpoint.py "<工作目录>" '
+            '--id CP1 --phase "..." --output "..." --basis "..."`\n\n',
+            encoding="utf-8")
         print(f"[创建] {cp_path}")
 
     print(f"\n工作目录：{workdir}")
-    print("下一步：append_checkpoint.py 写 CP0，然后进入 Phase 1 转写。")
+    print(f"  原文\\   转写稿放这里")
+    print(f"  纪要\\   交付物放这里")
+    print(f"  过程\\   meta.md / checkpoints.md")
     return 0
 
 

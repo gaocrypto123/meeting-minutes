@@ -1,0 +1,38 @@
+{
+  "_说明": "meeting-minutes-v2 配置。这里不含任何绝对路径，换电脑直接能用。",
+
+  "home": "",
+  "_home说明": "重资产（虚拟环境+模型）装在哪。留空 = 用户主目录下的 .meeting-minutes；也可以写 D:\\AIModels 这类绝对路径；环境变量 MM_HOME 优先级最高。",
+
+  "models_dir": "",
+  "_models_dir说明": "留空 = <home>\\models。如果你已经有一份模型仓库，可以在这里填它的绝对路径（只记路径，不复制）。",
+
+  "defaults": {
+    "asr_model": "small",
+    "_asr_model说明": "small 约 480 MB、快；medium 约 1.5 GB、更准。改这里即可切换。",
+    "language": "zh",
+    "chunk_seconds": 120,
+    "chunk_overlap_seconds": 5,
+    "threads": 8,
+    "vad": true
+  },
+
+  "glossary": "术语表.txt",
+  "_glossary说明": "通用术语纠错表（随包发布）。本机私有词条写在 术语表.local.txt，那个文件不随包发布。",
+
+  "diarization": {
+    "enabled": true,
+    "speakers": 0,
+    "_speakers说明": "已知说话人数就填（如 4）；0 = 自动判断。也可以在命令行用 --speakers 覆盖。",
+    "threshold": 1.0,
+    "_threshold说明": "声纹聚类阈值，越大越倾向于合并成少数人。人数已知时优先用 speakers 指定。",
+    "segmentation_model": "sherpa-segmentation-3.0\\model.onnx",
+    "embedding_model": "sherpa-embedding-zh\\3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+    "_模型说明": "相对路径按 models_dir 解析。"
+  },
+
+  "outputs": {
+    "default_choice": "ask",
+    "_可选值": "ask / word / digest / ppt / both"
+  }
+}

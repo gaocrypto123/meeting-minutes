@@ -1,294 +1,267 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""meeting-minutes · 环境体检（Phase 1 之前的必跑步骤）
+"""meeting-minutes v2 · 体检（换电脑、跑不动、报错时先跑这个）
 
-目的：**在动手之前**就搞清楚本机到底能不能转写，能走哪条路。
-不要让 AI 靠试错去猜——试错一轮就是十几分钟，用户等到崩溃。
-
-输出三件事：
-  1. 逐项体检结果（Python / pip 源 / 网络 / 依赖 / 本地模型）
-  2. 一个明确结论：推荐路径 A / B / C
-  3. 机器可读的 JSON（--json 输出路径），供 AI 直接读结论而不是猜
-
-路径判定：
-  A 直接转写   —— 依赖齐全 + 本地已有可用模型，立即可跑
-  B 需下载模型 —— 依赖齐全/可装 + 网络通，下载约 N 分钟后可用
-  C 转写不可用 —— 依赖装不上或网络不通。**此时不要重试，直接换人工供稿路径**
+把"能不能跑"拆成 8 项逐个检查，每项给出结论和修复建议。
+**它自己不需要任何第三方依赖**，所以环境再坏也能跑。
 
 用法：
-    python scripts/doctor.py
-    python scripts/doctor.py --json doctor.json
-    python scripts/doctor.py --size medium      # 指定想用的模型档位
+    python scripts/doctor.py            # 完整体检
+    python scripts/doctor.py --paths    # 只打印解析出来的路径
+    python scripts/doctor.py --offline  # 跳过联网检查
 """
+from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
-import time
 import urllib.request
 from pathlib import Path
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mm_common import PKG_ROOT, human, load_config  # noqa: E402
 
-# ---------------------------------------------------------------- 常量
+PASS, WARN, FAIL = "PASS", "WARN", "FAIL"
+ICON = {PASS: "✅", WARN: "⚠️ ", FAIL: "❌"}
 
-# 模型档位：越大越准，但下载越慢。远距离录音至少 medium，近距离可用 small/base
-SIZE_INFO = {
-    "base":   {"mib": 138,  "note": "138 MiB · 近场清晰录音勉强可用，远场基本不可用"},
-    "small":  {"mib": 461,  "note": "461 MiB · 近场可用，远场/远距离录音识别率差"},
-    "medium": {"mib": 1457, "note": "1457 MiB · 推荐。远场/手机远距离录音的最低可用档"},
-}
-DEFAULT_SIZE = "medium"
-
-# 下载源（实测 2026-09：hf-mirror 可用且支持 Range；官方源国内超时；
-# ModelScope 返回无 Content-Length、不支持续传，仅作最后兜底）
-MIRRORS = [
-    "https://hf-mirror.com/Systran/faster-whisper-{size}/resolve/main/{name}",
-    "https://hf-mirror.com/guillaumekln/faster-whisper-{size}/resolve/main/{name}",
-    "https://huggingface.co/Systran/faster-whisper-{size}/resolve/main/{name}",
-]
-MODEL_MIN_BYTES = {"base": 130 * 1024 ** 2, "small": 440 * 1024 ** 2, "medium": 1400 * 1024 ** 2}
-
-PIP_INDEX = "https://mirrors.cloud.tencent.com/pypi/simple"
-
-LINES = []
+PIP_INDEX = "https://pypi.tuna.tsinghua.edu.cn/simple"
+MODEL_HOST = "https://hf-mirror.com"
 
 
-def log(s=""):
-    print(s)
-    LINES.append(str(s))
-
-
-def default_model_root():
-    return Path.home() / ".workbuddy" / "binaries" / "models"
-
-
-# ---------------------------------------------------------------- 体检项
-
-def check_python():
-    log(f"[Python] {sys.version.split()[0]}  {sys.executable}")
-    return {"ok": True, "path": sys.executable, "version": sys.version.split()[0]}
-
-
-def check_modules():
-    res = {}
-    for mod in ("av", "numpy", "faster_whisper"):
-        try:
-            __import__(mod)
-            res[mod] = True
-        except Exception:
-            res[mod] = False
-    missing = [m for m, ok in res.items() if not ok]
-    log(f"[依赖] av={res['av']} numpy={res['numpy']} faster_whisper={res['faster_whisper']}")
-    if missing:
-        log(f"       缺失：{', '.join(missing)}")
-    return {"ok": not missing, "detail": res, "missing": missing}
-
-
-def _head(url, timeout=10):
-    """返回 (ok, detail)。只探连通性，不下数据。"""
+def run_py(python: str, code: str, timeout: int = 40):
+    """用指定解释器跑一段代码，返回 (ok, stdout)。"""
     try:
-        req = urllib.request.Request(url, method="HEAD",
-                                     headers={"User-Agent": "Mozilla/5.0"})
-        t0 = time.time()
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            clen = r.headers.get("Content-Length")
-            return True, f"HTTP {r.status} · {time.time() - t0:.1f}s" + (
-                f" · {int(clen) / 2 ** 20:.0f} MiB · Range={r.headers.get('Accept-Ranges')}"
-                if clen else "")
+        p = subprocess.run([python, "-c", code], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        return p.returncode == 0, (p.stdout or "") + (p.stderr or "")
     except Exception as e:
-        return False, f"{type(e).__name__}: {str(e)[:60]}"
-
-
-def check_network():
-    """探 pip 源 + 模型源。返回各源状态与最优可用源。"""
-    log("[网络] 探测中（每项最多 10 秒）…")
-    out = {"pip": None, "mirrors": [], "best": None}
-
-    ok, detail = _head(PIP_INDEX)
-    out["pip"] = {"ok": ok, "detail": detail}
-    log(f"       pip 源 {PIP_INDEX.split('/')[2]:28s} {'可达' if ok else '不可达'}  {detail}")
-
-    for tpl in MIRRORS:
-        url = tpl.format(size="small", name="config.json")
-        ok, detail = _head(url)
-        host = url.split("/")[2]
-        out["mirrors"].append({"url": tpl, "ok": ok, "detail": detail, "host": host})
-        log(f"       模型源 {host:28s} {'可达' if ok else '不可达'}  {detail}")
-        if ok and out["best"] is None:
-            out["best"] = tpl
-    out["ok"] = out["best"] is not None
-    return out
-
-
-def check_local_models():
-    root = default_model_root()
-    found = {}
-    for size, need in MODEL_MIN_BYTES.items():
-        d = root / f"faster-whisper-{size}"
-        mb = d / "model.bin"
-        ok = mb.exists() and mb.stat().st_size >= need
-        if mb.exists():
-            found[size] = {"dir": str(d), "ok": ok,
-                           "mib": round(mb.stat().st_size / 2 ** 20)}
-        else:
-            found[size] = {"dir": str(d), "ok": False, "mib": 0}
-    log(f"[模型] 根目录 {root}")
-    for size in ("base", "small", "medium"):
-        f = found[size]
-        flag = "可用" if f["ok"] else ("不完整" if f["mib"] else "未下载")
-        log(f"       {size:7s} {flag:6s} {f['mib']} MiB")
-    return {"root": str(root), "models": found,
-            "ready": [s for s, f in found.items() if f["ok"]]}
-
-
-def check_ffmpeg():
-    """ffmpeg 不是必需的（用 av 解码），但探一下便于排错。"""
-    for cmd in ("ffmpeg",):
-        try:
-            r = subprocess.run([cmd, "-version"], capture_output=True, timeout=8)
-            if r.returncode == 0:
-                log(f"[ffmpeg] 已安装")
-                return {"ok": True}
-        except Exception:
-            pass
-    log("[ffmpeg] 未安装（不影响，脚本用 av 库解码）")
-    return {"ok": False}
-
-
-# ---------------------------------------------------------------- 结论
-
-def decide(size, py, mods, net, models):
-    """产出路径结论。这是本脚本唯一重要的输出。"""
-    ready = models["ready"]
-    if mods["ok"] and size in ready:
-        return {
-            "path": "A",
-            "title": "路径 A · 立即可转写",
-            "action": f"直接跑：python scripts/transcribe.py <音频> --out 01-转写稿.md --model {size}",
-            "reason": f"依赖齐全，且本地已有可用的 {size} 模型。",
-            "blocking": False,
-        }
-    if size in ready and not mods["ok"]:
-        if net["pip"]["ok"]:
-            return {
-                "path": "A",
-                "title": "路径 A · 装完依赖即可转写",
-                "action": (f"{sys.executable} -m pip install -i {PIP_INDEX} "
-                           f"{' '.join(mods['missing'])} 然后跑 transcribe.py"),
-                "reason": f"模型已就位（{size}），只缺 Python 依赖，pip 源可达。",
-                "blocking": False,
-            }
-    if not net["ok"]:
-        return {
-            "path": "C",
-            "title": "路径 C · 转写不可用，改走人工供稿",
-            "action": "不要重试转写。请用户直接提供文字稿，见下方三条拿稿通道。",
-            "reason": "所有模型下载源均不可达，本机无法安装转写引擎。",
-            "blocking": True,
-        }
-    if not net["pip"]["ok"] and mods["missing"]:
-        return {
-            "path": "C",
-            "title": "路径 C · 转写不可用，改走人工供稿",
-            "action": "不要重试转写。请用户直接提供文字稿，见下方三条拿稿通道。",
-            "reason": "pip 源不可达且依赖缺失，无法安装转写引擎。",
-            "blocking": True,
-        }
-    mib = SIZE_INFO.get(size, {}).get("mib", 0)
-    return {
-        "path": "B",
-        "title": "路径 B · 需先下载模型",
-        "action": (f"python scripts/transcribe.py <音频> --out 01-转写稿.md --model {size}"
-                   f"（脚本会自动下载约 {mib} MiB，断点续传）"),
-        "reason": f"网络可达，需下载 {size} 模型（约 {mib} MiB）。",
-        "blocking": False,
-        "download_mib": mib,
-    }
+        return False, f"{type(e).__name__}: {e}"
 
 
 MANUAL_CHANNELS = """三条拿稿通道（按推荐顺序）：
-  1. 会议平台自带纪要 —— 腾讯会议 / 飞书妙记 / 钉钉闪记 都自带「转写 + 自动纪要」，
-     录完即可导出文字稿，准确率远高于本地离线转写。这是最省事的路。
-  2. 手机录音机自带转写 —— iPhone 备忘录录音、小米/华为/OPPO 录音机大多有「转文字」，
-     导出后直接给 AI。
-  3. 剪映 / 讯飞听见 / 网易见外 —— 导入音频导出字幕或文稿，多数有免费额度。
-
-拿到文字稿后直接交给 AI，从 Phase 2 开始即可，转写这步可以整个跳过。
-"""
+1. 会议平台自带纪要 —— 腾讯会议 / 飞书妙记 / 钉钉闪记 都自带「转写 + 自动纪要」，
+   录完即可导出文字稿，准确率高于本地离线转写。这是最省事的路。
+2. 手机录音机自带转写 —— iPhone 备忘录录音、小米/华为/OPPO 录音机大多有「转文字」。
+3. 剪映 / 讯飞听见 / 网易见外 —— 导入音频导出字幕或文稿，多数有免费额度。"""
 
 
-def main():
-    ap = argparse.ArgumentParser(description="meeting-minutes 环境体检")
-    ap.add_argument("--size", default=DEFAULT_SIZE, choices=list(SIZE_INFO),
-                    help=f"希望使用的模型档位，默认 {DEFAULT_SIZE}")
-    ap.add_argument("--json", dest="json_out", default=None,
-                    help="把结构化结论写到指定 JSON 文件，供 AI 读取")
-    ap.add_argument("--skip-network", action="store_true", help="跳过网络探测（离线体检）")
+def decide_route(checks) -> dict:
+    """把体检结果翻译成「走哪条路」的结论 —— 用结论取代试错。
+
+    A 立即可转写 / B 需先装依赖或下模型 / C 本机不具备条件，转人工供稿。
+    退出码 3 代表 C，AI 看到就该立刻转路 3，不要再尝试。
+    """
+    by = {c["name"]: c for c in checks}
+    deps_ok = by.get("依赖包", {}).get("status") == PASS
+    model_ok = by.get("转写模型", {}).get("status") == PASS
+    net = by.get("联网", {})
+    # 任一镜像可达即视为网络可用：bootstrap 内置多源会依次尝试，
+    # 单个源探测失败（镜像常拒 HEAD/带 UA 限制）不代表装不上。
+    net_ok = "✓" in net.get("detail", "")
+    net_unknown = "跳过" in net.get("detail", "")
+
+    if deps_ok and model_ok:
+        return {"path": "A", "title": "路径 A · 立即可转写",
+                "reason": "依赖与转写模型都已就位。",
+                "action": "直接跑 transcribe.py，建议先试跑 1 分钟确认音质。",
+                "channels": MANUAL_CHANNELS}
+    if net_ok or net_unknown:
+        need = []
+        if not deps_ok:
+            need.append("依赖")
+        if not model_ok:
+            need.append("模型")
+        return {"path": "B", "title": "路径 B · 需先装依赖或下载模型",
+                "reason": "网络可达，缺 " + "、".join(need) + "。",
+                "action": "python scripts/bootstrap.py --install --models small；"
+                          "装完再跑一次本命令确认。",
+                "channels": MANUAL_CHANNELS}
+    return {"path": "C", "title": "路径 C · 本机不具备转写条件，转人工供稿",
+            "reason": "网络不可达，且依赖或模型缺失，无法安装本地转写引擎。",
+            "action": "不要重试转写。请用户直接提供文字稿，见下方三条通道。",
+            "channels": MANUAL_CHANNELS}
+
+
+def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    ap = argparse.ArgumentParser(description="meeting-minutes v3 环境体检（含路线结论）")
+    ap.add_argument("--paths", action="store_true", help="只打印解析出的路径")
+    ap.add_argument("--offline", action="store_true", help="跳过联网检查")
+    ap.add_argument("--json", action="store_true", help="以 JSON 输出结论")
     args = ap.parse_args()
 
-    log("=" * 66)
-    log(" meeting-minutes · 环境体检")
-    log(f" 目标模型档位：{args.size}  —— {SIZE_INFO[args.size]['note']}")
-    log("=" * 66)
-    log("")
+    cfg = load_config()
+    home, models_dir = Path(cfg["home"]), Path(cfg["models_dir"])
+    vpy, venv = Path(cfg["python"]), Path(cfg["venv"])
 
-    py = check_python()
-    mods = check_modules()
-    ffmpeg = check_ffmpeg()
-    if args.skip_network:
-        net = {"ok": False, "pip": {"ok": False, "detail": "已跳过"}, "mirrors": [], "best": None}
-        log("[网络] 已按 --skip-network 跳过")
+    if args.paths:
+        for k in ("home", "models_dir", "envs_dir", "python", "glossary"):
+            v = cfg.get(k, "")
+            if k == "glossary" and v and not Path(v).is_absolute():
+                v = str(PKG_ROOT / v)
+            print(f"{k} = {v}")
+        print(f"config = {cfg.get('_config_path')}")
+        print(f"config.local = {cfg.get('_local_config') or '（无）'}")
+        return 0
+
+    checks = []
+
+    def add(name, status, detail, fix=""):
+        checks.append({"name": name, "status": status, "detail": detail, "fix": fix})
+
+    # 1 运行时
+    ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    if sys.version_info >= (3, 9):
+        status = PASS if sys.version_info < (3, 13) else WARN
+        add("Python 版本", status, f"当前 {ver}",
+            "3.13+ 部分依赖可能没有现成安装包，建议 3.10–3.12" if status == WARN else "")
     else:
-        net = check_network()
-    models = check_local_models()
-    log("")
+        add("Python 版本", FAIL, f"当前 {ver}，需要 3.9 及以上",
+            "到 python.org 或 miniconda 装一个 3.10–3.12")
 
-    verdict = decide(args.size, py, mods, net, models)
+    # 2 配置解析
+    add("配置解析", PASS, f"home={home}（来源：{cfg.get('_config_path')}"
+        + (f" + {Path(cfg['_local_config']).name}" if cfg.get("_local_config") else "") + "）")
 
-    log("=" * 66)
-    log(f" 结论：{verdict['title']}")
-    log("=" * 66)
-    log(f" 依据：{verdict['reason']}")
-    log(f" 动作：{verdict['action']}")
-    log("")
-    if verdict["path"] == "C":
-        log("  !! 本机不具备本地转写条件。不要反复尝试下载或换源，")
-        log("  !! 也不要试图用浏览器去蹭在线转写网站（需登录/验证码/付费，成功率极低）。")
-        log("")
-        for ln in MANUAL_CHANNELS.strip().splitlines():
-            log("  " + ln)
-    elif verdict["path"] == "B":
-        log(f"  预计下载 {verdict.get('download_mib', 0)} MiB。若网络慢，可先试小档：")
-        log("    --model base   （138 MiB，近场录音够用，远场会明显变差）")
-        log("    --model small  （461 MiB，折中）")
-        log("  中断后重跑会自动续传，不会白下。")
+    # 3 虚拟环境
+    if vpy.exists():
+        ok, out = run_py(str(vpy), "import sys;print(sys.version.split()[0])")
+        add("虚拟环境", PASS if ok else FAIL,
+            f"{vpy}" + (f"（{out.strip()[:40]}）" if ok else f" 无法运行：{out.strip()[:80]}"),
+            "" if ok else "删掉后重跑 bootstrap.py --install")
     else:
-        log("  建议先用 --limit 60 试跑前 60 秒确认音质，再跑全量。")
+        add("虚拟环境", FAIL, f"不存在：{vpy}",
+            f"运行：python scripts/bootstrap.py --install --models small")
 
-    result = {
-        "python": py, "modules": mods, "ffmpeg": ffmpeg, "network": net,
-        "models": models, "size": args.size, "verdict": verdict,
-        "manual_channels": MANUAL_CHANNELS,
-    }
-    if args.json_out:
-        p = Path(args.json_out)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        log("")
-        log(f"[JSON] 结构化结论已写入 {p}")
-    return 0 if not verdict["blocking"] else 3
+    # 4 依赖
+    probe = ("import importlib.util as u;"
+             "mods=['av','faster_whisper','sherpa_onnx','docx','pptx'];"
+             "print(','.join(m for m in mods if not u.find_spec(m)))")
+    if not vpy.exists():
+        add("依赖包", FAIL, "无法检测——虚拟环境还没建",
+            "运行：python scripts/bootstrap.py --install")
+    else:
+        ok, out = run_py(str(vpy), probe)
+        missing = [m for m in (out.strip().splitlines() or [""])[0].split(",") if m]
+        if ok and not missing:
+            add("依赖包", PASS, "av / faster-whisper / sherpa-onnx / python-docx / python-pptx 齐全")
+        else:
+            add("依赖包", FAIL, "缺少：" + ("、".join(missing) or "无法检测"),
+                "运行：python scripts/bootstrap.py --install")
+
+    # 5 转写模型
+    found = []
+    for size in ("small", "medium", "large-v3", "base", "tiny"):
+        d = models_dir / f"faster-whisper-{size}"
+        if (d / "model.bin").exists():
+            found.append(f"{size}（{human((d / 'model.bin').stat().st_size)}）")
+    want = cfg["defaults"]["asr_model"]
+    if found:
+        has_want = any(f.startswith(want) for f in found)
+        add("转写模型", PASS if has_want else WARN,
+            f"已就位：{'、'.join(found)}；配置要求：{want}",
+            "" if has_want else f"运行：python scripts/bootstrap.py --models {want}")
+    else:
+        add("转写模型", FAIL, f"没有找到任何模型（找的是 {models_dir}）",
+            f"运行：python scripts/bootstrap.py --models {want}")
+
+    # 6 说话人分离模型
+    seg = Path(cfg["diarization"]["segmentation_model"])
+    emb = Path(cfg["diarization"]["embedding_model"])
+    if seg.exists() and emb.exists():
+        add("说话人分离模型", PASS, f"{human(seg.stat().st_size)} + {human(emb.stat().st_size)}")
+    else:
+        add("说话人分离模型", WARN, "缺少分割或声纹模型，转写仍可跑，但不会有发言人编号",
+            "运行：python scripts/bootstrap.py --with-diarization")
+
+    # 7 磁盘
+    probe_path = home if home.exists() else home.anchor or "."
+    try:
+        free = shutil.disk_usage(str(probe_path)).free
+        if free >= 3 * 1024 ** 3:
+            add("磁盘空间", PASS, f"{str(home)[:3]} 剩余 {human(free)}")
+        else:
+            add("磁盘空间", WARN, f"剩余 {human(free)}，装 medium 模型可能不够",
+                "换到空间大的盘：python scripts/bootstrap.py --home D:\\AIModels")
+    except Exception as e:
+        add("磁盘空间", WARN, f"无法读取：{e}")
+
+    # 8 联网
+    if args.offline:
+        add("联网", WARN, "已按 --offline 跳过")
+    else:
+        reach = []
+        for url, label in ((PIP_INDEX, "pip 镜像"), (MODEL_HOST, "模型镜像")):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                urllib.request.urlopen(req, timeout=8)
+                reach.append(f"{label}✓")
+            except Exception as e:
+                reach.append(f"{label}✗({type(e).__name__})")
+        n_ok = sum(1 for r in reach if "✓" in r)
+        if n_ok == len(reach):
+            add("联网", PASS, "、".join(reach))
+        elif n_ok == 0:
+            add("联网", FAIL, "、".join(reach),
+                "一个镜像都连不上：只能手动下载依赖与模型，"
+                "见 安装说明.md 的『没有网络怎么办』；或直接转人工供稿路径")
+        else:
+            add("联网", WARN, "、".join(reach),
+                "部分镜像不通不影响 —— bootstrap 会自动换源，"
+                "只有全部不通才需要走人工供稿")
+
+    route = decide_route(checks)
+
+    if args.json:
+        print(json.dumps({"checks": checks, "route": route}, ensure_ascii=False, indent=2))
+        return 3 if route["path"] == "C" else 0
+
+    print("=" * 66)
+    print("meeting-minutes v2 · 环境体检")
+    print("=" * 66)
+    for c in checks:
+        print(f"{ICON[c['status']]} {c['name']}：{c['detail']}")
+        if c["fix"]:
+            print(f"      → {c['fix']}")
+    n_fail = sum(1 for c in checks if c["status"] == FAIL)
+    n_warn = sum(1 for c in checks if c["status"] == WARN)
+    print("-" * 66)
+    if n_fail:
+        print(f"体检：有 {n_fail} 项必须先解决。")
+    elif n_warn:
+        print(f"体检：可以跑，但有 {n_warn} 项需要注意（见上面的箭头）。")
+    else:
+        print("体检：全部就绪。")
+
+    print("")
+    print("=" * 66)
+    print(f"路线结论：{route['title']}")
+    print("=" * 66)
+    print(f"  依据：{route['reason']}")
+    print(f"  动作：{route['action']}")
+    if route["path"] == "C":
+        print("")
+        print("  !! 本机不具备本地转写条件。不要反复尝试安装或换源，")
+        print("  !! 也不要试图用浏览器去蹭在线转写网站（需登录/验证码/付费，成功率极低）。")
+        print("")
+        for ln in route["channels"].strip().splitlines():
+            print("  " + ln)
+        print("")
+        print("  拿到文字稿后直接交给 AI，从 Phase 2 开始即可，转写这步可以整个跳过。")
+    elif route["path"] == "B":
+        print("")
+        print("  若安装/下载始终不成功，不要死磕 —— 转路 3 用人工供稿更快。")
+
+    return 3 if route["path"] == "C" else (1 if n_fail else 0)
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Exception:
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    raise SystemExit(main())

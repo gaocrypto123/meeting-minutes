@@ -1,0 +1,6 @@
+# 宽松版：不锁版本，谁新装谁。锁定版装不上时用它兜底。
+av>=11
+faster-whisper>=1.0
+sherpa-onnx>=1.10
+python-docx>=1.1
+python-pptx>=0.6.23

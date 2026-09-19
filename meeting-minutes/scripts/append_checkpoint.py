@@ -54,9 +54,12 @@ def main() -> int:
     args = ap.parse_args()
 
     workdir = Path(args.workspace).expanduser().resolve()
-    cp_path = workdir / "checkpoints.md"
+    cp_path = workdir / "过程" / "checkpoints.md"     # v2 结构
     if not cp_path.exists():
-        print(f"[错误] 找不到 {cp_path}。先跑 init_meeting_workspace.py。", file=sys.stderr)
+        cp_path = workdir / "checkpoints.md"          # 兼容旧结构
+    if not cp_path.exists():
+        print(f"[错误] 在 {workdir} 下找不到 checkpoints.md（过程/ 或根目录）。"
+              f"先跑 init_meeting_workspace.py。", file=sys.stderr)
         return 2
 
     text = cp_path.read_text(encoding="utf-8")

@@ -25,19 +25,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-TEMPLATES = {
-    "跨部门对接": ["会议背景", "议题与讨论要点", "意见总结", "行动项", "待确认与风险"],
-    "内部工作会": ["会议背景", "进展同步", "问题与阻塞", "意见总结", "行动项与下周计划"],
-    "决策评审": ["会议背景与评审对象", "评审意见", "决策结论", "行动项", "待确认与风险"],
-    "外部沟通": ["会议背景", "客户需求与反馈", "我方回应与承诺", "行动项", "待确认与风险"],
-}
-
-ALIASES = {
-    "跨部门": "跨部门对接", "对接": "跨部门对接", "跨部门对接会": "跨部门对接",
-    "内部": "内部工作会", "工作会": "内部工作会", "例会": "内部工作会", "周会": "内部工作会",
-    "决策": "决策评审", "评审": "决策评审", "决策评审会": "决策评审",
-    "外部": "外部沟通", "客户": "外部沟通", "外部沟通会": "外部沟通",
-}
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mm_common import load_templates, resolve_template  # noqa: E402
+from verify_refs import (  # noqa: E402
+    TS_RE as REF_TS_RE, anchor_hits, is_pending as ref_pending, load_transcript,
+    tss_to_seconds,
+)
 
 KNOWN_KINDS = {"需求", "共识", "决策", "技术要点", "行动项", "方案", "风险", "问题", "进展", "待定事项"}
 SOURCE_REQUIRED = {"需求", "共识", "决策", "技术要点", "行动项", "方案"}
@@ -144,6 +137,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="会议纪要确定性质检")
     ap.add_argument("minutes", help="纪要初稿路径，如 03-纪要初稿.md")
     ap.add_argument("--transcript", default="", help="转写稿路径，用于 Q4 比对来源")
+    ap.add_argument("--transcript-json", default="",
+                    help="转写稿 JSON（transcribe.py --out-json 产出），用于 Q6 锚点校验")
     ap.add_argument("--template", default="", help="会议类型：跨部门对接/内部工作会/决策评审/外部沟通")
     ap.add_argument("--out", default="", help="质检报告输出路径，默认与纪要同目录的 04-质检报告.md")
     ap.add_argument("--meeting-name", default="", help="会议名称，写入报告标题")
@@ -160,14 +155,16 @@ def main() -> int:
     if not items:
         print("[警告] 未解析到任何要点条目。检查条目格式是否为 `- **决策 D1**：……`", file=sys.stderr)
 
-    template_key = ALIASES.get(args.template.strip(), args.template.strip())
-    expected, q2_note = [], ""
+    templates = load_templates()
+    template_key, expected, q2_note = "", [], ""
     if args.template:
-        if template_key in TEMPLATES:
-            expected = TEMPLATES[template_key]
-            template_key = template_key
+        resolved = resolve_template(args.template)
+        if resolved:
+            template_key = resolved
+            expected = templates[resolved]
         else:
-            q2_note = f"未能识别会议类型 '{args.template}'"
+            q2_note = (f"未能识别会议类型 '{args.template}'；"
+                       f"可选：{'、'.join(templates)}")
     else:
         template_key = "未指定"
         q2_note = "未提供 --template，本节未执行"
@@ -315,10 +312,36 @@ def main() -> int:
             q5_warn.append((group[0], f"同一表述出现在不同类型：{'、'.join(g['kind'] for g in group)}"))
     results["Q5"] = (not q5_fail, q5_fail)
 
+    # ---- Q6 出处可验证（锚点对账） ----
+    q6_fail, q6_note = [], ""
+    if args.transcript_json:
+        tj = Path(args.transcript_json).expanduser().resolve()
+        if tj.exists():
+            tr = load_transcript(tj)
+            intervals = tr["turns"] or tr["segments"]
+            for it in items:
+                src = it["fields"].get("出处", "")
+                anchors = [tss_to_seconds(m) for m in REF_TS_RE.finditer(src)]
+                if not ref_pending(it["fields"].get("状态", "")) and not anchors:
+                    q6_fail.append((it, "需要出处，但出处里没有可识别的时间戳"))
+                    continue
+                for t in anchors:
+                    if not anchor_hits(t, intervals):
+                        q6_fail.append((it, f"时间戳 "
+                                            f"{t // 3600:02d}:{(t % 3600) // 60:02d}:{t % 60:02d}"
+                                            f" 在转写稿里找不到对应发言"))
+        else:
+            q6_note = f"找不到转写稿 JSON：{tj}"
+    else:
+        q6_note = "未提供 --transcript-json"
+    results["Q6"] = (not q6_fail, q6_fail)
+
     # ---- 报告 ----
     label = {"Q1": "可回溯性", "Q2": "章节完整性", "Q3": "行动项三要素", "Q4": "无凭空内容", "Q5": "去重"}
-    order = ["Q1", "Q2", "Q3", "Q4", "Q5"]
-    executed = [k for k in order if not (k == "Q2" and q2_note)]
+    label["Q6"] = "出处可验证"
+    order = ["Q1", "Q2", "Q3", "Q4", "Q5", "Q6"]
+    notes = {"Q2": q2_note, "Q6": q6_note}
+    executed = [k for k in order if not notes.get(k)]
     passed = sum(1 for k in executed if results[k][0])
     total = len(executed)
     if passed < total:
@@ -345,8 +368,8 @@ def main() -> int:
     ]
     for k in order:
         ok, fails = results[k]
-        if k == "Q2" and q2_note:
-            lines.append(f"| Q{k[1]} {label[k]} | 未执行 | {q2_note} | 补 `--template` 后重跑 |")
+        if notes.get(k):
+            lines.append(f"| Q{k[1]} {label[k]} | 未执行 | {notes[k]} | 补上参数后重跑 |")
             continue
         if ok:
             lines.append(f"| Q{k[1]} {label[k]} | PASS | — | — |")
@@ -358,7 +381,7 @@ def main() -> int:
     any_fail = False
     for k in order:
         ok, fails = results[k]
-        if ok or (k == "Q2" and q2_note):
+        if ok or notes.get(k):
             continue
         any_fail = True
         lines.append(f"### {k} {label[k]}")
@@ -417,8 +440,8 @@ def main() -> int:
     print(f"结论：{overall}（{passed}/{total} 项通过）")
     for k in order:
         ok, fails = results[k]
-        if k == "Q2" and q2_note:
-            print(f"  {k} {label[k]}：未执行（{q2_note}）")
+        if notes.get(k):
+            print(f"  {k} {label[k]}：未执行（{notes[k]}）")
         else:
             print(f"  {k} {label[k]}：{'PASS' if ok else 'FAIL' + '（' + str(len(fails)) + ' 项）'}")
     print(f"报告：{out_path}")
