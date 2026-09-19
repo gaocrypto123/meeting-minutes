@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.part
+*.progress.json
+
+# 转写模型体积巨大，不要进仓库
+models/
+*.bin
+
+# 会议工作产物（含真实录音内容，属隐私）
+*_纪要/
+.DS_Store
+Thumbs.db
