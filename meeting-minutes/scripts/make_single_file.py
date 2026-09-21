@@ -18,6 +18,12 @@ from pathlib import Path
 PKG_ROOT = Path(__file__).resolve().parent.parent
 OUT_NAME = "单文件版-可直接粘贴给AI.md"
 
+
+def docs_dir() -> Path:
+    """单文件版放哪：仓库里统一归到 docs/，独立安装时就放技能包根目录。"""
+    d = PKG_ROOT.parent / "docs"
+    return d if d.is_dir() else PKG_ROOT
+
 PARTS = [
     ("第一部分 · 主流程", "SKILL.md"),
     ("第二部分 · 章节模板（含采访访谈）", "references/templates.md"),
@@ -71,6 +77,7 @@ def main() -> int:
 | `init_meeting_workspace.py` | 建工作目录 + 开工确认单 |
 | `transcribe.py` | 本地转写 + 说话人分离 + 术语纠错 |
 | `diarize.py` | 单独调说话人分离（改人数/阈值） |
+| `make_manual_template.py` | 转不了写时的补录模板（路 3） |
 | `qc_check.py` | 六项质检 |
 | `verify_refs.py` | 出处锚点对账，验证引用真伪 |
 | `build_outputs.py` | 出 Word / HTML |
@@ -82,7 +89,7 @@ def main() -> int:
 
 没有脚本也能跑纯文字流程，只是转写要另想办法、质检要人工自查。
 """)
-    out = PKG_ROOT / OUT_NAME
+    out = docs_dir() / OUT_NAME
     out.write_text("".join(chunks), encoding="utf-8")
     print(f"[生成] {out}（{out.stat().st_size / 1024:.1f} KB）")
     if missing:

@@ -73,13 +73,18 @@ v2 的整个流程建立在「录音能转写」这个前提上。**一旦装不
 | Claude Code | `~/.claude/skills/` 或 `项目/.claude/skills/` |
 
 ```
-meeting-minutes/
+meeting-minutes/             ← 技能本体，整个拷到技能目录即可
 ├── SKILL.md                 ← 主流程（先读第一条规则）
+├── README.md                ← 这个目录是什么、人看的文档在哪
 ├── config.json              ← 配置（不含绝对路径，换电脑能用）
 ├── 术语表.txt                ← 听错词纠错表
 ├── references/              ← 五套章节模板 / 证据与质检规范 / 版式规范
-└── scripts/                 ← 13 个脚本
+└── scripts/                 ← 15 个脚本，速查表见 scripts/README.md
+
+docs/                        ← 给人看的：说明书 / 安装说明 / 单文件版
 ```
+
+技能本体里只有 AI 要读的文件；`docs/` 是给人看的，不用拷进技能目录。
 
 ### 2. 装环境（重资产，一次就行）
 
@@ -256,9 +261,9 @@ python scripts/verify_refs.py "<工作目录>"
 
 ## 文档
 
-- [`说明书.md`](meeting-minutes/说明书.md) —— 面向使用者的完整说明
-- [`安装说明.md`](meeting-minutes/安装说明.md) —— 安装步骤与「没有网络怎么办」
-- [`单文件版-可直接粘贴给AI.md`](meeting-minutes/单文件版-可直接粘贴给AI.md) —— 不想装技能？整份复制粘进对话即可
+- [`说明书.md`](docs/说明书.md) —— 面向使用者的完整说明
+- [`安装说明.md`](docs/安装说明.md) —— 安装步骤与「没有网络怎么办」
+- [`单文件版-可直接粘贴给AI.md`](docs/单文件版-可直接粘贴给AI.md) —— 不想装技能？整份复制粘进对话即可
 
 ## License
 

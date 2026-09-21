@@ -5,7 +5,7 @@
 > 纯文字流程不受影响；**转写、说话人分离、质检、出 Word/PPT 需要 scripts/，
 > 这些脚本不在本文件里**（本文件只是说明书）。
 >
-> 本文件由 `scripts/make_single_file.py` 自动生成，生成时间：2026-09-19 21:37
+> 本文件由 `scripts/make_single_file.py` 自动生成，生成时间：2026-09-21 14:29
 > 不要手改，改源头（SKILL.md / references）后重新生成。
 
 ---
@@ -688,6 +688,7 @@ Q6 是 v2 新增，也是最重要的一项：**它把"出处"从一句声明变
 | `init_meeting_workspace.py` | 建工作目录 + 开工确认单 |
 | `transcribe.py` | 本地转写 + 说话人分离 + 术语纠错 |
 | `diarize.py` | 单独调说话人分离（改人数/阈值） |
+| `make_manual_template.py` | 转不了写时的补录模板（路 3） |
 | `qc_check.py` | 六项质检 |
 | `verify_refs.py` | 出处锚点对账，验证引用真伪 |
 | `build_outputs.py` | 出 Word / HTML |

@@ -41,6 +41,10 @@ INCLUDE = [
     "scripts",
 ]
 
+# 人类文档的两个可能位置：仓库里统一放 docs/，独立安装时就在技能包根目录。
+# 两个都认，找不到才跳过。
+DOC_FALLBACK_DIRS = ("docs",)
+
 # 明确不带（本地/私有/中间产物）
 EXCLUDE_NAMES = {
     "config.local.json", "术语表.local.txt", "打包-敏感词.txt",
@@ -147,7 +151,15 @@ def main() -> int:
     for name in INCLUDE:
         src = PKG_ROOT / name
         if not src.exists():
-            continue
+            # 文档类可能已归到仓库的 docs/，去那儿找
+            for d in DOC_FALLBACK_DIRS:
+                alt = PKG_ROOT.parent / d / name
+                if alt.exists():
+                    src = alt
+                    break
+            else:
+                print(f"[跳过] 找不到 {name}（技能包根目录和 docs/ 都没有）")
+                continue
         if src.is_file():
             if src.name in skip:
                 continue
